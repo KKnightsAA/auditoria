@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="Auditoría Móvil de Edificio",
+    page_title="Auditoría Móvil de Edificio version 2",
     page_icon="🏢",
     layout="centered",
     initial_sidebar_state="collapsed",
