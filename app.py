@@ -14,9 +14,9 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-PHOTOS_DIR = DATA_DIR / "photos"
+MEDIA_DIR = DATA_DIR / "media"
 DATA_DIR.mkdir(exist_ok=True)
-PHOTOS_DIR.mkdir(exist_ok=True)
+MEDIA_DIR.mkdir(exist_ok=True)
 
 STATUS_OPTIONS = ["Pendiente", "Perfecto estado", "Necesita mantenimiento", "Mal estado", "No aplica"]
 STATUS_FACTOR = {
@@ -232,12 +232,13 @@ def init_state():
     if "responses" not in st.session_state:
         st.session_state.responses = {}
         for space in CHECKLIST:
-            for question, weight in space["items"]:
+            for question, _ in space["items"]:
                 key = f"{space['space']}|{question}"
                 st.session_state.responses[key] = {
                     "status": "Pendiente",
                     "observation": "",
                     "action": "Sin acción",
+                    "media_saved": [],
                 }
     if "saved_message" not in st.session_state:
         st.session_state.saved_message = ""
@@ -274,6 +275,7 @@ def calculate_score():
                         "Acción": entry["action"],
                         "Observación": entry["observation"],
                         "Peso": weight,
+                        "Evidencias": len(entry.get("media_saved", [])),
                     }
                 )
 
@@ -294,15 +296,104 @@ def score_label(score: float):
     return "Brechas relevantes", "summary-bad"
 
 
+def build_media_payloads(key: str):
+    payloads = []
+
+    quick_photo = st.session_state.get(f"camera_{slugify(key)}")
+    if quick_photo is not None:
+        payloads.append(
+            {
+                "source": "camera",
+                "name": quick_photo.name or "foto_capturada.jpg",
+                "mime": quick_photo.type or "image/jpeg",
+                "bytes": quick_photo.getbuffer().tobytes(),
+            }
+        )
+
+    uploaded_media = st.session_state.get(f"media_{slugify(key)}") or []
+    for media in uploaded_media:
+        payloads.append(
+            {
+                "source": "uploader",
+                "name": media.name,
+                "mime": media.type,
+                "bytes": media.getbuffer().tobytes(),
+            }
+        )
+
+    return payloads
+
+
+
+def persist_media_files(timestamp: str, key: str):
+    payloads = build_media_payloads(key)
+    saved_files = []
+
+    if not payloads:
+        return saved_files
+
+    audit_media_dir = MEDIA_DIR / timestamp
+    audit_media_dir.mkdir(parents=True, exist_ok=True)
+
+    seen_signatures = set()
+    key_slug = slugify(key)
+
+    for idx, payload in enumerate(payloads, start=1):
+        raw_bytes = payload["bytes"]
+        signature = (payload["name"], len(raw_bytes), payload["mime"])
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+
+        original_suffix = Path(payload["name"] or "archivo").suffix
+        suffix = original_suffix or guess_extension(payload["mime"])
+        file_name = f"{key_slug}_{idx}{suffix}"
+        file_path = audit_media_dir / file_name
+        file_path.write_bytes(raw_bytes)
+
+        saved_files.append(
+            {
+                "name": file_name,
+                "original_name": payload["name"],
+                "source": payload["source"],
+                "mime": payload["mime"],
+                "path": str(file_path),
+            }
+        )
+
+    return saved_files
+
+
+
+def guess_extension(mime_type: str | None) -> str:
+    mime_map = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+        "video/x-msvideo": ".avi",
+        "video/webm": ".webm",
+    }
+    return mime_map.get(mime_type or "", ".bin")
+
+
+
 def save_audit():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     score, progress, issues, answered, total_questions = calculate_score()
 
     rows = []
+    issues_with_media = []
+
     for space in CHECKLIST:
         for question, weight in space["items"]:
             key = f"{space['space']}|{question}"
             entry = st.session_state.responses[key]
+            saved_media = persist_media_files(timestamp, key)
+            entry["media_saved"] = saved_media
+            st.session_state.responses[key] = entry
+
             row = {
                 "timestamp": timestamp,
                 "building": st.session_state.audit_meta["building"],
@@ -315,10 +406,25 @@ def save_audit():
                 "status": entry["status"],
                 "action": entry["action"],
                 "observation": entry["observation"],
+                "evidence_count": len(saved_media),
+                "evidence_paths": json.dumps([item["path"] for item in saved_media], ensure_ascii=False),
                 "score_total": score,
                 "progress": progress,
             }
             rows.append(row)
+
+            if entry["status"] in ["Necesita mantenimiento", "Mal estado"]:
+                issues_with_media.append(
+                    {
+                        "Espacio": space["space"],
+                        "Pregunta": question,
+                        "Estado": entry["status"],
+                        "Acción": entry["action"],
+                        "Observación": entry["observation"],
+                        "Peso": weight,
+                        "Evidencias": saved_media,
+                    }
+                )
 
     df = pd.DataFrame(rows)
     csv_path = DATA_DIR / "auditorias_detalle.csv"
@@ -334,12 +440,13 @@ def save_audit():
         "progress": progress,
         "answered": answered,
         "total_questions": total_questions,
-        "issues": issues,
+        "issues": issues_with_media,
         "general_notes": st.session_state.audit_meta["general_notes"],
     }
     json_path = DATA_DIR / f"auditoria_{timestamp}.json"
     json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     st.session_state.saved_message = f"Auditoría guardada: {json_path.name}"
+
 
 
 def header():
@@ -349,7 +456,7 @@ def header():
             <div style="display:flex; justify-content:space-between; gap:12px; align-items:flex-start;">
                 <div>
                     <div style="font-size:1.25rem; font-weight:800; color:#16324d;">Auditoría móvil del edificio</div>
-                    <div class="muted">Checklist por espacios, foto por hallazgo y score sobre 100.</div>
+                    <div class="muted">Checklist por espacios, fotos y videos por hallazgo, con score sobre 100.</div>
                 </div>
                 <div class="badge">Móvil first</div>
             </div>
@@ -357,6 +464,7 @@ def header():
         """,
         unsafe_allow_html=True,
     )
+
 
 
 def render_meta():
@@ -388,6 +496,7 @@ def render_meta():
     st.markdown('</div>', unsafe_allow_html=True)
 
 
+
 def render_dashboard():
     score, progress, issues, answered, total_questions = calculate_score()
     label, css = score_label(score)
@@ -407,14 +516,35 @@ def render_dashboard():
         st.caption("Sin hallazgos activos todavía.")
 
 
+
+def render_evidence_preview(key: str):
+    quick_photo = st.session_state.get(f"camera_{slugify(key)}")
+    uploaded_media = st.session_state.get(f"media_{slugify(key)}") or []
+
+    if quick_photo is not None:
+        st.image(quick_photo, caption="Foto rápida capturada", use_container_width=True)
+
+    if uploaded_media:
+        st.caption(f"Evidencias seleccionadas: {len(uploaded_media)}")
+        for media in uploaded_media:
+            mime_type = media.type or ""
+            if mime_type.startswith("image/"):
+                st.image(media, caption=media.name, use_container_width=True)
+            elif mime_type.startswith("video/"):
+                st.video(media)
+            else:
+                st.info(f"Archivo adjunto: {media.name}")
+
+
+
 def render_space(space):
     total_weight = sum(weight for _, weight in space["items"])
     with st.expander(f"{space['space']} · {total_weight} pts", expanded=False):
         st.markdown(
-            f"<div class='space-title'>{space['space']}</div><div class='muted'>Marca el estado de cada punto. Si hay hallazgo, agrega foto y observación.</div>",
+            f"<div class='space-title'>{space['space']}</div><div class='muted'>Marca el estado de cada punto. Si hay hallazgo, agrega fotos, video y observación.</div>",
             unsafe_allow_html=True,
         )
-        for idx, (question, weight) in enumerate(space["items"]):
+        for question, weight in space["items"]:
             key = f"{space['space']}|{question}"
             entry = st.session_state.responses[key]
             st.markdown('<div class="item-card">', unsafe_allow_html=True)
@@ -430,23 +560,32 @@ def render_space(space):
             )
 
             if entry["status"] in ["Necesita mantenimiento", "Mal estado"]:
-                a1, a2 = st.columns([1, 1])
-                with a1:
-                    entry["action"] = st.selectbox(
-                        "Acción requerida",
-                        ACTION_OPTIONS,
-                        key=f"action_{slugify(key)}",
-                        index=ACTION_OPTIONS.index(entry.get("action", "Sin acción")),
-                    )
-                with a2:
-                    st.markdown("<div class='small-label'>Foto de respaldo</div>", unsafe_allow_html=True)
-                    uploaded = st.camera_input(
-                        "Tomar foto",
-                        key=f"camera_{slugify(key)}",
-                        label_visibility="collapsed",
-                    )
-                    if uploaded:
-                        st.success("Foto capturada")
+                entry["action"] = st.selectbox(
+                    "Acción requerida",
+                    ACTION_OPTIONS,
+                    key=f"action_{slugify(key)}",
+                    index=ACTION_OPTIONS.index(entry.get("action", "Sin acción")),
+                )
+
+                st.markdown("<div class='small-label'>Evidencia rápida</div>", unsafe_allow_html=True)
+                st.camera_input(
+                    "Tomar foto",
+                    key=f"camera_{slugify(key)}",
+                    label_visibility="collapsed",
+                )
+
+                st.markdown("<div class='small-label'>Fotos o video adicionales</div>", unsafe_allow_html=True)
+                st.file_uploader(
+                    "Subir evidencias",
+                    type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "avi", "webm"],
+                    accept_multiple_files=True,
+                    key=f"media_{slugify(key)}",
+                    label_visibility="collapsed",
+                    help="Puedes seleccionar varias imágenes y también un video del hallazgo.",
+                )
+
+                render_evidence_preview(key)
+
                 entry["observation"] = st.text_area(
                     "Observación",
                     key=f"obs_{slugify(key)}",
@@ -461,17 +600,44 @@ def render_space(space):
             st.session_state.responses[key] = entry
 
 
+
+def reset_responses():
+    for space in CHECKLIST:
+        for question, _ in space["items"]:
+            key = f"{space['space']}|{question}"
+            st.session_state.responses[key] = {
+                "status": "Pendiente",
+                "observation": "",
+                "action": "Sin acción",
+                "media_saved": [],
+            }
+            for widget_key in [
+                f"status_{slugify(key)}",
+                f"action_{slugify(key)}",
+                f"obs_{slugify(key)}",
+                f"camera_{slugify(key)}",
+                f"media_{slugify(key)}",
+            ]:
+                if widget_key in st.session_state:
+                    del st.session_state[widget_key]
+
+
+
 def render_summary():
-    score, progress, issues, answered, total_questions = calculate_score()
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.markdown("### Resumen final")
     st.write(
         "Revisa el score, los hallazgos y guarda la auditoría. Luego podrás usar esta base para crear seguimiento interno."
     )
 
+    score, progress, issues, answered, total_questions = calculate_score()
     if issues:
         df = pd.DataFrame(issues)
-        st.dataframe(df[["Espacio", "Pregunta", "Estado", "Acción"]], hide_index=True, use_container_width=True)
+        st.dataframe(
+            df[["Espacio", "Pregunta", "Estado", "Acción", "Evidencias"]],
+            hide_index=True,
+            use_container_width=True,
+        )
     else:
         st.success("No se detectaron hallazgos en esta auditoría.")
 
@@ -494,14 +660,10 @@ def render_summary():
                 st.success(st.session_state.saved_message)
     with col2:
         if st.button("Reiniciar respuestas", use_container_width=True):
-            for key in st.session_state.responses.keys():
-                st.session_state.responses[key] = {
-                    "status": "Pendiente",
-                    "observation": "",
-                    "action": "Sin acción",
-                }
+            reset_responses()
             st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
+
 
 
 def architecture_view():
@@ -511,7 +673,7 @@ def architecture_view():
             **Flujo recomendado**
 
             1. **Inicio móvil**: auditor selecciona edificio, sector y tipo de revisión.  
-            2. **Checklist por espacios**: preguntas cortas, estados rápidos y foto solo cuando hay hallazgo.  
+            2. **Checklist por espacios**: preguntas cortas, estados rápidos y evidencia multimedia cuando hay hallazgo.  
             3. **Score automático**: cálculo sobre 100 con resumen por espacio.  
             4. **Guardado**: cada auditoría queda persistida y lista para dashboard.  
             5. **Seguimiento**: los hallazgos pueden transformarse luego en tickets internos.
@@ -519,10 +681,14 @@ def architecture_view():
             **Arquitectura MVP**
             - Front móvil: Streamlit
             - Persistencia inicial: CSV / JSON local
-            - Evidencia: fotos capturadas desde celular
+            - Evidencia: fotos y videos capturados desde celular
             - Evolución futura: base de datos + dashboard + integración con tickets
             """
         )
+        st.caption(
+            "Nota: en Streamlit, la foto rápida sí se puede capturar directo. Para video, este MVP usa carga de archivo; en varios móviles eso permite grabar o elegir un video desde la cámara, pero depende del navegador."
+        )
+
 
 
 def main():
