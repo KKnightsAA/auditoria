@@ -593,6 +593,19 @@ def sync_case_tables_from_drive(force: bool = False) -> None:
     sync_master_tables_from_drive(force=force)
 
 
+def try_sync_from_drive(force: bool = False, scope: str = "datos") -> bool:
+    if not drive_enabled():
+        st.session_state.drive_sync_status = {"ok": True, "message": "Google Drive no está habilitado."}
+        return False
+    try:
+        sync_master_tables_from_drive(force=force)
+        st.session_state.drive_sync_status = {"ok": True, "message": f"Sincronización con Google Drive completada para {scope}."}
+        return True
+    except Exception as e:
+        st.session_state.drive_sync_status = {"ok": False, "message": f"No se pudo sincronizar con Google Drive ({scope}): {e}"}
+        return False
+
+
 def upload_saved_media_to_drive(audit_id: str, key: str, saved_files: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str, str]:
     if not drive_enabled() or not saved_files:
         return saved_files, "", ""
@@ -745,6 +758,8 @@ def init_state() -> None:
         st.session_state.saved_message = ""
     if "last_save_result" not in st.session_state:
         st.session_state.last_save_result = {}
+    if "drive_sync_status" not in st.session_state:
+        st.session_state.drive_sync_status = {"ok": True, "message": ""}
 
 
 # -----------------------------
@@ -1817,7 +1832,21 @@ def render_summary() -> None:
 
 def render_history_tab() -> None:
     st.markdown("### Historial, reportes y evidencias")
-    sync_master_tables_from_drive(force=True)
+    c_sync1, c_sync2 = st.columns([1, 1])
+    with c_sync1:
+        if st.button("Sincronizar historial con Google Drive", key="sync_history_drive"):
+            if try_sync_from_drive(force=True, scope="historial"):
+                st.success(st.session_state.drive_sync_status["message"])
+            else:
+                st.warning(st.session_state.drive_sync_status["message"])
+    with c_sync2:
+        status = st.session_state.get("drive_sync_status", {"ok": True, "message": ""})
+        if status.get("message"):
+            if status.get("ok", False):
+                st.caption(status["message"])
+            else:
+                st.caption(f"Último aviso Drive: {status['message']}")
+    try_sync_from_drive(force=False, scope="historial")
     paths = get_storage_paths()
     audits_path = paths["audits"] / "audits_summary.csv"
     items_path = paths["audits"] / "audit_items.csv"
@@ -1932,7 +1961,21 @@ def render_history_tab() -> None:
 
 def render_cases_tab() -> None:
     st.markdown("### Seguimiento de casos")
-    sync_case_tables_from_drive(force=True)
+    c_sync1, c_sync2 = st.columns([1, 1])
+    with c_sync1:
+        if st.button("Sincronizar casos con Google Drive", key="sync_cases_drive"):
+            if try_sync_from_drive(force=True, scope="casos"):
+                st.success(st.session_state.drive_sync_status["message"])
+            else:
+                st.warning(st.session_state.drive_sync_status["message"])
+    with c_sync2:
+        status = st.session_state.get("drive_sync_status", {"ok": True, "message": ""})
+        if status.get("message"):
+            if status.get("ok", False):
+                st.caption(status["message"])
+            else:
+                st.caption(f"Último aviso Drive: {status['message']}")
+    try_sync_from_drive(force=False, scope="casos")
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
