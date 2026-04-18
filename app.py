@@ -406,11 +406,6 @@ def drive_enabled() -> bool:
     return bool(get_google_drive_config().get("enabled", False))
 
 
-def set_drive_status(message: str, level: str = "info") -> None:
-    st.session_state["drive_status_message"] = message
-    st.session_state["drive_status_level"] = level
-
-
 def get_drive_client():
     cfg = get_google_drive_config()
     if not cfg.get("enabled"):
@@ -554,75 +549,126 @@ def download_drive_file_to_path(file_id: str, destination: Path) -> None:
     destination.write_bytes(fh.getvalue())
 
 
+
+
+def set_drive_status(level: str, message: str) -> None:
+    st.session_state["drive_status"] = {"level": level, "message": message, "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def get_drive_status() -> dict[str, str]:
+    return st.session_state.get("drive_status", {})
+
+
+def render_drive_status() -> None:
+    status = get_drive_status()
+    if not status:
+        return
+    msg = f"{status.get('message', '')} ({status.get('at', '')})"
+    level = status.get('level', 'info')
+    if level == 'success':
+        st.success(msg)
+    elif level == 'warning':
+        st.warning(msg)
+    elif level == 'error':
+        st.error(msg)
+    else:
+        st.info(msg)
 def sync_master_tables_from_drive(force: bool = False) -> None:
     if not drive_enabled():
+        set_drive_status("info", "Google Drive no está habilitado. Se usan datos locales.")
         return
     if st.session_state.get("drive_master_synced") and not force:
         return
 
     paths = get_storage_paths()
-    folder_map = get_drive_folder_map()
-    service = get_drive_client()
-    if not folder_map or service is None:
-        return
+    try:
+        folder_map = get_drive_folder_map()
+        service = get_drive_client()
+        if not folder_map or service is None:
+            set_drive_status("warning", "No se pudo inicializar Google Drive. Se usan datos locales.")
+            return
 
-    for section, file_name in MASTER_TABLES:
-        parent_id = folder_map[section]["id"]
-        drive_file = find_drive_file(service, parent_id, file_name)
-        if drive_file:
-            local_path = paths[section] / file_name
+        downloaded = 0
+        for section, file_name in MASTER_TABLES:
+            parent_id = folder_map[section]["id"]
             try:
-                download_drive_file_to_path(drive_file["id"], local_path)
-            except Exception:
-                pass
+                drive_file = find_drive_file(service, parent_id, file_name)
+            except Exception as exc:
+                set_drive_status("warning", f"No se pudo consultar Google Drive: {exc}. Se usan datos locales.")
+                return
+            if drive_file:
+                local_path = paths[section] / file_name
+                try:
+                    download_drive_file_to_path(drive_file["id"], local_path)
+                    downloaded += 1
+                except Exception:
+                    pass
 
-    st.session_state.drive_master_synced = True
+        st.session_state.drive_master_synced = True
+        set_drive_status("success", f"Sincronización desde Google Drive completada. Archivos descargados: {downloaded}.")
+    except Exception as exc:
+        set_drive_status("warning", f"No se pudo sincronizar desde Google Drive: {exc}. Se usan datos locales.")
 
 
 def sync_master_tables_to_drive() -> None:
     if not drive_enabled():
         return
 
-    paths = get_storage_paths()
-    folder_map = get_drive_folder_map()
-    if not folder_map:
-        return
+    try:
+        paths = get_storage_paths()
+        folder_map = get_drive_folder_map()
+        if not folder_map:
+            return
 
-    for section, file_name in MASTER_TABLES:
-        local_path = paths[section] / file_name
-        if local_path.exists():
-            upload_file_to_drive(local_path, folder_map[section]["id"], mime_type="text/csv", overwrite=True)
+        uploaded = 0
+        for section, file_name in MASTER_TABLES:
+            local_path = paths[section] / file_name
+            if local_path.exists():
+                result = upload_file_to_drive(local_path, folder_map[section]["id"], mime_type="text/csv", overwrite=True)
+                if result:
+                    uploaded += 1
+        set_drive_status("success", f"Sincronización hacia Google Drive completada. Archivos subidos: {uploaded}.")
+    except Exception as exc:
+        set_drive_status("warning", f"No se pudo subir a Google Drive: {exc}. Los datos siguen guardados localmente.")
 
 
 def sync_case_tables_from_drive(force: bool = False) -> None:
-    try:
-        sync_master_tables_from_drive(force=force)
-    except Exception as exc:
-        set_drive_status(f"No se pudo sincronizar casos desde Google Drive: {exc}", "warning")
+    sync_master_tables_from_drive(force=force)
 
 
 def upload_saved_media_to_drive(audit_id: str, key: str, saved_files: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str, str]:
     if not drive_enabled() or not saved_files:
         return saved_files, "", ""
 
-    folder_map = get_drive_folder_map()
-    service = get_drive_client()
-    if not folder_map or service is None:
+    try:
+        folder_map = get_drive_folder_map()
+        service = get_drive_client()
+        if not folder_map or service is None:
+            return saved_files, "", ""
+
+        audit_folder = ensure_drive_folder(service, folder_map["media"]["id"], audit_id)
+        item_folder = ensure_drive_folder(service, audit_folder["id"], slugify(key))
+
+        enriched = []
+        failed = 0
+        for media in saved_files:
+            try:
+                uploaded = upload_file_to_drive(Path(media["path"]), item_folder["id"], mime_type=media.get("mime"), overwrite=True)
+            except Exception:
+                uploaded = {}
+                failed += 1
+            enriched.append({
+                **media,
+                "drive_file_id": uploaded.get("id", ""),
+                "drive_web_view_link": uploaded.get("webViewLink", ""),
+                "drive_web_content_link": uploaded.get("webContentLink", ""),
+            })
+        if failed:
+            set_drive_status("warning", f"Algunas evidencias no se pudieron subir a Google Drive ({failed}). La auditoría seguirá guardándose localmente.")
+        return enriched, audit_folder.get("id", ""), audit_folder.get("webViewLink", "")
+    except Exception as exc:
+        set_drive_status("warning", f"No se pudieron subir evidencias a Google Drive: {exc}. La auditoría seguirá guardándose localmente.")
         return saved_files, "", ""
-
-    audit_folder = ensure_drive_folder(service, folder_map["media"]["id"], audit_id)
-    item_folder = ensure_drive_folder(service, audit_folder["id"], slugify(key))
-
-    enriched = []
-    for media in saved_files:
-        uploaded = upload_file_to_drive(Path(media["path"]), item_folder["id"], mime_type=media.get("mime"), overwrite=True)
-        enriched.append({
-            **media,
-            "drive_file_id": uploaded.get("id", ""),
-            "drive_web_view_link": uploaded.get("webViewLink", ""),
-            "drive_web_content_link": uploaded.get("webContentLink", ""),
-        })
-    return enriched, audit_folder.get("id", ""), audit_folder.get("webViewLink", "")
 
 
 def sync_artifact_to_drive(local_path: Path, section: str, mime_type: str) -> dict[str, Any]:
@@ -634,7 +680,7 @@ def sync_artifact_to_drive(local_path: Path, section: str, mime_type: str) -> di
             return {}
         return upload_file_to_drive(local_path, folder_map[section]["id"], mime_type=mime_type, overwrite=True)
     except Exception as exc:
-        set_drive_status(f"No se pudo subir {local_path.name} a Google Drive: {exc}", "warning")
+        set_drive_status("warning", f"No se pudo subir {local_path.name} a Google Drive: {exc}. Se mantiene localmente.")
         return {}
 
 
@@ -757,6 +803,8 @@ def init_state() -> None:
         st.session_state.saved_message = ""
     if "last_save_result" not in st.session_state:
         st.session_state.last_save_result = {}
+    if "drive_status" not in st.session_state:
+        st.session_state.drive_status = {}
 
 
 # -----------------------------
@@ -1162,7 +1210,7 @@ def generate_report_json(
 # -----------------------------
 
 def upsert_followup_cases(audit_id: str, items_df: pd.DataFrame) -> tuple[int, int]:
-    sync_case_tables_from_drive(force=False)
+    # sincronización manual opcional con Drive
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -1269,7 +1317,7 @@ def upsert_followup_cases(audit_id: str, items_df: pd.DataFrame) -> tuple[int, i
 
 
 def update_case_record(case_id: str, updates: dict[str, Any], note: str) -> None:
-    sync_case_tables_from_drive(force=False)
+    # sincronización manual opcional con Drive
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -1308,7 +1356,7 @@ def update_case_record(case_id: str, updates: dict[str, Any], note: str) -> None
 # -----------------------------
 
 def save_audit() -> None:
-    sync_master_tables_from_drive(force=False)
+    # sincronización manual opcional con Drive
     audit_id = now_id("AUD")
     timestamp_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     score, progress, issues, answered, total_questions = calculate_score()
@@ -1433,13 +1481,10 @@ def save_audit() -> None:
 
     media_drive_folder_link = ""
     if drive_enabled():
-        try:
-            folder_map = get_drive_folder_map()
-            service = get_drive_client()
-            if folder_map and service is not None:
-                media_drive_folder_link = ensure_drive_folder(service, folder_map["media"]["id"], audit_id).get("webViewLink", "")
-        except Exception as exc:
-            set_drive_status(f"No se pudo obtener la carpeta de evidencias en Drive: {exc}", "warning")
+        folder_map = get_drive_folder_map()
+        service = get_drive_client()
+        if folder_map and service is not None:
+            media_drive_folder_link = ensure_drive_folder(service, folder_map["media"]["id"], audit_id).get("webViewLink", "")
 
     audits_summary_df = pd.DataFrame(
         [
@@ -1648,10 +1693,6 @@ def render_storage_config() -> None:
         )
 
         st.caption("Las credenciales de Google Drive no se ingresan aquí. Deben ir en los Secrets del despliegue de Streamlit.")
-        status_msg = st.session_state.get("drive_status_message", "")
-        if status_msg:
-            level = st.session_state.get("drive_status_level", "info")
-            getattr(st, level if level in {"success", "warning", "error", "info"} else "info")(status_msg)
 
 
 def render_meta() -> None:
@@ -1815,8 +1856,13 @@ def render_summary() -> None:
             elif not st.session_state.audit_meta["auditor"].strip():
                 st.error("Ingresa el nombre del auditor antes de guardar.")
             else:
-                save_audit()
-                st.success(st.session_state.saved_message)
+                try:
+                    save_audit()
+                    st.success(st.session_state.saved_message)
+                except Exception as exc:
+                    set_drive_status("error", f"Error al guardar auditoría: {exc}")
+                    st.error(f"No se pudo guardar la auditoría completa: {exc}")
+                    return
                 result = st.session_state.last_save_result
                 st.info(
                     f"Reporte: {result.get('report_path', '-')} · JSON: {result.get('json_path', '-')} · Casos creados: {result.get('cases_created', 0)} · actualizados: {result.get('cases_updated', 0)}"
@@ -1836,16 +1882,12 @@ def render_summary() -> None:
 
 def render_history_tab() -> None:
     st.markdown("### Historial, reportes y evidencias")
-    c_sync1, c_sync2 = st.columns([1,2])
+    render_drive_status()
+    c_sync1, c_sync2 = st.columns([1,3])
     with c_sync1:
-        if st.button("Sincronizar historial con Drive"):
+        if st.button("Sincronizar historial con Google Drive"):
             sync_master_tables_from_drive(force=True)
-    with c_sync2:
-        status_msg = st.session_state.get("drive_status_message", "")
-        if status_msg:
-            level = st.session_state.get("drive_status_level", "info")
-            getattr(st, level if level in {"success", "warning", "error", "info"} else "info")(status_msg)
-    sync_master_tables_from_drive(force=False)
+            st.rerun()
     paths = get_storage_paths()
     audits_path = paths["audits"] / "audits_summary.csv"
     items_path = paths["audits"] / "audit_items.csv"
@@ -1960,16 +2002,12 @@ def render_history_tab() -> None:
 
 def render_cases_tab() -> None:
     st.markdown("### Seguimiento de casos")
-    c_sync1, c_sync2 = st.columns([1,2])
+    render_drive_status()
+    c_sync1, c_sync2 = st.columns([1,3])
     with c_sync1:
-        if st.button("Sincronizar casos con Drive"):
+        if st.button("Sincronizar casos con Google Drive"):
             sync_case_tables_from_drive(force=True)
-    with c_sync2:
-        status_msg = st.session_state.get("drive_status_message", "")
-        if status_msg:
-            level = st.session_state.get("drive_status_level", "info")
-            getattr(st, level if level in {"success", "warning", "error", "info"} else "info")(status_msg)
-    sync_case_tables_from_drive(force=False)
+            st.rerun()
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -2042,9 +2080,13 @@ def render_cases_tab() -> None:
             "due_date": due_date_value.isoformat() if due_date_value else "",
         }
         note = followup_note.strip() or f"Caso actualizado a estado {case_status}."
-        update_case_record(selected_case_id, updates, note)
-        st.success("Seguimiento guardado.")
-        st.rerun()
+        try:
+            update_case_record(selected_case_id, updates, note)
+            st.success("Seguimiento guardado.")
+            st.rerun()
+        except Exception as exc:
+            set_drive_status("error", f"No se pudo guardar el seguimiento: {exc}")
+            st.error(f"No se pudo guardar el seguimiento: {exc}")
 
     if not events_df.empty:
         case_events = events_df[events_df["case_id"] == selected_case_id].sort_values("event_at", ascending=False)
