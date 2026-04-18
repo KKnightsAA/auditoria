@@ -1,3 +1,4 @@
+import io
 import json
 import re
 import unicodedata
@@ -310,6 +311,16 @@ assert sum(sum(item["weight"] for item in space["items"]) for space in CHECKLIST
 # Helpers de configuración
 # -----------------------------
 
+MASTER_TABLES = [
+    ("audits", "audits_summary.csv"),
+    ("audits", "audit_items.csv"),
+    ("audits", "audit_space_scores.csv"),
+    ("audits", "audit_evidence.csv"),
+    ("tracking", "cases_followup.csv"),
+    ("tracking", "case_events.csv"),
+]
+
+
 def default_storage_root() -> Path:
     return APP_DIR / "mq_auditorias_storage"
 
@@ -348,6 +359,271 @@ def get_storage_paths() -> dict[str, Path]:
         "tracking": tracking_dir,
         "exports": exports_dir,
     }
+
+
+def get_google_drive_config() -> dict[str, Any]:
+    try:
+        raw_cfg = st.secrets["google_drive"]
+        cfg = dict(raw_cfg)
+    except Exception:
+        return {"enabled": False, "reason": "No hay sección [google_drive] en secrets."}
+
+    enabled = bool(cfg.get("enabled", True))
+    folder_id = str(cfg.get("folder_id", "")).strip()
+    service_account_json = str(cfg.get("service_account_json", "")).strip()
+
+    if not enabled:
+        return {"enabled": False, "reason": "Google Drive está desactivado en secrets."}
+    if not folder_id:
+        return {"enabled": False, "reason": "Falta google_drive.folder_id en secrets."}
+    if not service_account_json:
+        return {"enabled": False, "reason": "Falta google_drive.service_account_json en secrets."}
+
+    return {
+        "enabled": True,
+        "folder_id": folder_id,
+        "service_account_json": service_account_json,
+    }
+
+
+@st.cache_resource(show_spinner=False)
+def get_drive_service(service_account_json: str):
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    info = json.loads(service_account_json)
+    if "private_key" in info and isinstance(info["private_key"], str):
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+
+    credentials = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/drive"],
+    )
+    return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def drive_enabled() -> bool:
+    return bool(get_google_drive_config().get("enabled", False))
+
+
+def get_drive_client():
+    cfg = get_google_drive_config()
+    if not cfg.get("enabled"):
+        return None
+    try:
+        return get_drive_service(cfg["service_account_json"])
+    except Exception as exc:
+        st.session_state["drive_init_error"] = str(exc)
+        return None
+
+
+def _drive_query_escape(value: str) -> str:
+    return value.replace("'", "\\'")
+
+
+def ensure_drive_folder(service, parent_id: str, folder_name: str) -> dict[str, str]:
+    escaped_name = _drive_query_escape(folder_name)
+    query = (
+        f"name = '{escaped_name}' and mimeType = 'application/vnd.google-apps.folder' "
+        f"and '{parent_id}' in parents and trashed = false"
+    )
+    response = service.files().list(
+        q=query,
+        fields="files(id, name, webViewLink)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        pageSize=10,
+    ).execute()
+    files = response.get("files", [])
+    if files:
+        folder = files[0]
+        return {
+            "id": folder["id"],
+            "name": folder.get("name", folder_name),
+            "webViewLink": folder.get("webViewLink", f"https://drive.google.com/drive/folders/{folder['id']}"),
+        }
+
+    metadata = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    created = service.files().create(
+        body=metadata,
+        fields="id, name, webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+    return {
+        "id": created["id"],
+        "name": created.get("name", folder_name),
+        "webViewLink": created.get("webViewLink", f"https://drive.google.com/drive/folders/{created['id']}"),
+    }
+
+
+def get_drive_folder_map() -> dict[str, dict[str, str]]:
+    if "drive_folder_map" in st.session_state:
+        return st.session_state.drive_folder_map
+
+    cfg = get_google_drive_config()
+    service = get_drive_client()
+    if not cfg.get("enabled") or service is None:
+        return {}
+
+    root_id = cfg["folder_id"]
+    folder_map = {
+        "root": {
+            "id": root_id,
+            "name": "root",
+            "webViewLink": f"https://drive.google.com/drive/folders/{root_id}",
+        }
+    }
+    folder_specs = [
+        ("audits", "01_auditorias"),
+        ("media", "02_evidencias"),
+        ("reports", "03_reportes"),
+        ("tracking", "04_seguimiento"),
+        ("exports", "05_exports"),
+    ]
+    for key, folder_name in folder_specs:
+        folder_map[key] = ensure_drive_folder(service, root_id, folder_name)
+
+    st.session_state.drive_folder_map = folder_map
+    return folder_map
+
+
+def find_drive_file(service, parent_id: str, file_name: str) -> dict[str, Any] | None:
+    escaped_name = _drive_query_escape(file_name)
+    query = f"name = '{escaped_name}' and '{parent_id}' in parents and trashed = false"
+    response = service.files().list(
+        q=query,
+        fields="files(id, name, mimeType, webViewLink, webContentLink)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        pageSize=10,
+    ).execute()
+    files = response.get("files", [])
+    return files[0] if files else None
+
+
+def upload_file_to_drive(local_path: Path, parent_id: str, mime_type: str | None = None, overwrite: bool = True) -> dict[str, Any]:
+    service = get_drive_client()
+    if service is None:
+        return {}
+
+    from googleapiclient.http import MediaFileUpload
+
+    existing = find_drive_file(service, parent_id, local_path.name) if overwrite else None
+    media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=False)
+
+    if existing:
+        uploaded = service.files().update(
+            fileId=existing["id"],
+            media_body=media,
+            fields="id, name, webViewLink, webContentLink",
+            supportsAllDrives=True,
+        ).execute()
+    else:
+        metadata = {"name": local_path.name, "parents": [parent_id]}
+        uploaded = service.files().create(
+            body=metadata,
+            media_body=media,
+            fields="id, name, webViewLink, webContentLink",
+            supportsAllDrives=True,
+        ).execute()
+    return uploaded
+
+
+def download_drive_file_to_path(file_id: str, destination: Path) -> None:
+    service = get_drive_client()
+    if service is None:
+        return
+    from googleapiclient.http import MediaIoBaseDownload
+
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(fh.getvalue())
+
+
+def sync_master_tables_from_drive(force: bool = False) -> None:
+    if not drive_enabled():
+        return
+    if st.session_state.get("drive_master_synced") and not force:
+        return
+
+    paths = get_storage_paths()
+    folder_map = get_drive_folder_map()
+    service = get_drive_client()
+    if not folder_map or service is None:
+        return
+
+    for section, file_name in MASTER_TABLES:
+        parent_id = folder_map[section]["id"]
+        drive_file = find_drive_file(service, parent_id, file_name)
+        if drive_file:
+            local_path = paths[section] / file_name
+            try:
+                download_drive_file_to_path(drive_file["id"], local_path)
+            except Exception:
+                pass
+
+    st.session_state.drive_master_synced = True
+
+
+def sync_master_tables_to_drive() -> None:
+    if not drive_enabled():
+        return
+
+    paths = get_storage_paths()
+    folder_map = get_drive_folder_map()
+    if not folder_map:
+        return
+
+    for section, file_name in MASTER_TABLES:
+        local_path = paths[section] / file_name
+        if local_path.exists():
+            upload_file_to_drive(local_path, folder_map[section]["id"], mime_type="text/csv", overwrite=True)
+
+
+def sync_case_tables_from_drive(force: bool = False) -> None:
+    sync_master_tables_from_drive(force=force)
+
+
+def upload_saved_media_to_drive(audit_id: str, key: str, saved_files: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str, str]:
+    if not drive_enabled() or not saved_files:
+        return saved_files, "", ""
+
+    folder_map = get_drive_folder_map()
+    service = get_drive_client()
+    if not folder_map or service is None:
+        return saved_files, "", ""
+
+    audit_folder = ensure_drive_folder(service, folder_map["media"]["id"], audit_id)
+    item_folder = ensure_drive_folder(service, audit_folder["id"], slugify(key))
+
+    enriched = []
+    for media in saved_files:
+        uploaded = upload_file_to_drive(Path(media["path"]), item_folder["id"], mime_type=media.get("mime"), overwrite=True)
+        enriched.append({
+            **media,
+            "drive_file_id": uploaded.get("id", ""),
+            "drive_web_view_link": uploaded.get("webViewLink", ""),
+            "drive_web_content_link": uploaded.get("webContentLink", ""),
+        })
+    return enriched, audit_folder.get("id", ""), audit_folder.get("webViewLink", "")
+
+
+def sync_artifact_to_drive(local_path: Path, section: str, mime_type: str) -> dict[str, Any]:
+    if not drive_enabled() or not local_path.exists():
+        return {}
+    folder_map = get_drive_folder_map()
+    if not folder_map:
+        return {}
+    return upload_file_to_drive(local_path, folder_map[section]["id"], mime_type=mime_type, overwrite=True)
 
 
 # -----------------------------
@@ -713,9 +989,13 @@ def generate_report_html(
             file_paths = json.loads(row.get("evidence_paths", "[]"))
         except json.JSONDecodeError:
             file_paths = []
-        for path_str in file_paths:
+        try:
+            drive_links = json.loads(row.get("evidence_drive_links", "[]"))
+        except json.JSONDecodeError:
+            drive_links = []
+        for idx, path_str in enumerate(file_paths):
             p = Path(path_str)
-            href = p.resolve().as_uri() if p.exists() else html_escape(path_str)
+            href = drive_links[idx] if idx < len(drive_links) and drive_links[idx] else (p.resolve().as_uri() if p.exists() else html_escape(path_str))
             links.append(f"<a href='{href}' target='_blank'>{html_escape(p.name)}</a>")
         evidence_rows.append(
             "<tr>"
@@ -870,6 +1150,7 @@ def generate_report_json(
 # -----------------------------
 
 def upsert_followup_cases(audit_id: str, items_df: pd.DataFrame) -> tuple[int, int]:
+    sync_case_tables_from_drive(force=True)
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -971,10 +1252,12 @@ def upsert_followup_cases(audit_id: str, items_df: pd.DataFrame) -> tuple[int, i
         append_dataframe(events_path, pd.DataFrame(event_rows))
     elif not events_path.exists():
         pd.DataFrame(columns=event_columns).to_csv(events_path, index=False)
+    sync_master_tables_to_drive()
     return created, updated
 
 
 def update_case_record(case_id: str, updates: dict[str, Any], note: str) -> None:
+    sync_case_tables_from_drive(force=True)
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -1005,6 +1288,7 @@ def update_case_record(case_id: str, updates: dict[str, Any], note: str) -> None
         ]
     )
     append_dataframe(events_path, event_row)
+    sync_master_tables_to_drive()
 
 
 # -----------------------------
@@ -1012,6 +1296,7 @@ def update_case_record(case_id: str, updates: dict[str, Any], note: str) -> None
 # -----------------------------
 
 def save_audit() -> None:
+    sync_master_tables_from_drive(force=True)
     audit_id = now_id("AUD")
     timestamp_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     score, progress, issues, answered, total_questions = calculate_score()
@@ -1028,10 +1313,13 @@ def save_audit() -> None:
             key = f"{space['space']}|{question}"
             entry = st.session_state.responses[key]
             saved_media = persist_media_files(audit_id, key)
+            saved_media, drive_item_folder_id, drive_item_folder_link = upload_saved_media_to_drive(audit_id, key, saved_media)
             entry["media_saved"] = saved_media
             st.session_state.responses[key] = entry
 
             evidence_paths = [media["path"] for media in saved_media]
+            evidence_drive_links = [media.get("drive_web_view_link", "") for media in saved_media]
+            evidence_drive_ids = [media.get("drive_file_id", "") for media in saved_media]
             row = {
                 "audit_id": audit_id,
                 "timestamp_human": timestamp_human,
@@ -1049,6 +1337,10 @@ def save_audit() -> None:
                 "priority": priority_from_status(entry["status"]) if entry["status"] in ["Necesita mantenimiento", "Mal estado"] else "",
                 "evidence_count": len(saved_media),
                 "evidence_paths": json.dumps(evidence_paths, ensure_ascii=False),
+                "evidence_drive_links": json.dumps(evidence_drive_links, ensure_ascii=False),
+                "evidence_drive_ids": json.dumps(evidence_drive_ids, ensure_ascii=False),
+                "evidence_drive_folder_id": drive_item_folder_id,
+                "evidence_drive_folder_link": drive_item_folder_link,
                 "score_total": score,
                 "progress": progress,
                 "report_path": "",
@@ -1069,6 +1361,9 @@ def save_audit() -> None:
                         "original_name": media["original_name"],
                         "path": media["path"],
                         "source": media["source"],
+                        "drive_file_id": media.get("drive_file_id", ""),
+                        "drive_web_view_link": media.get("drive_web_view_link", ""),
+                        "drive_web_content_link": media.get("drive_web_content_link", ""),
                     }
                 )
 
@@ -1121,6 +1416,16 @@ def save_audit() -> None:
     )
     items_df["report_path"] = str(report_path.resolve())
 
+    report_drive = sync_artifact_to_drive(report_path, "reports", "text/html")
+    json_drive = sync_artifact_to_drive(json_report_path, "audits", "application/json")
+
+    media_drive_folder_link = ""
+    if drive_enabled():
+        folder_map = get_drive_folder_map()
+        service = get_drive_client()
+        if folder_map and service is not None:
+            media_drive_folder_link = ensure_drive_folder(service, folder_map["media"]["id"], audit_id).get("webViewLink", "")
+
     audits_summary_df = pd.DataFrame(
         [
             {
@@ -1141,7 +1446,10 @@ def save_audit() -> None:
                 "cases_updated": cases_updated,
                 "report_path": str(report_path.resolve()),
                 "json_path": str(json_report_path.resolve()),
+                "report_drive_link": report_drive.get("webViewLink", ""),
+                "json_drive_link": json_drive.get("webViewLink", ""),
                 "evidence_dir": str((paths["media"] / audit_id).resolve()),
+                "evidence_drive_folder_link": media_drive_folder_link,
             }
         ]
     )
@@ -1159,6 +1467,9 @@ def save_audit() -> None:
 
     export_path = paths["exports"] / f"auditoria_{audit_id}_detalle.csv"
     items_df.to_csv(export_path, index=False)
+    export_drive = sync_artifact_to_drive(export_path, "exports", "text/csv")
+
+    sync_master_tables_to_drive()
 
     st.session_state.saved_message = f"Auditoría guardada: {audit_id}"
     st.session_state.last_save_result = {
@@ -1169,6 +1480,9 @@ def save_audit() -> None:
         "cases_created": cases_created,
         "cases_updated": cases_updated,
         "evidence_dir": str((paths["media"] / audit_id).resolve()),
+        "report_drive_link": report_drive.get("webViewLink", ""),
+        "json_drive_link": json_drive.get("webViewLink", ""),
+        "export_drive_link": export_drive.get("webViewLink", ""),
     }
 
 
@@ -1282,29 +1596,43 @@ def header() -> None:
 
 def render_storage_config() -> None:
     with st.expander("Configuración de almacenamiento y nube"):
+        cfg = get_google_drive_config()
+        drive_ok = drive_enabled() and get_drive_client() is not None
+
+        st.markdown("#### Backend actual")
+        if drive_ok:
+            folder_map = get_drive_folder_map()
+            st.success("Google Drive conectado correctamente. Esta app puede guardar desde el teléfono y dejar todo en tu Drive.")
+            st.write(f"**Carpeta raíz Drive:** `{cfg.get('folder_id', '')}`")
+            if folder_map.get("root", {}).get("webViewLink"):
+                st.link_button("Abrir carpeta raíz en Drive", folder_map["root"]["webViewLink"])
+        else:
+            reason = cfg.get("reason", st.session_state.get("drive_init_error", "No se pudo inicializar Google Drive."))
+            st.warning(f"Google Drive no está activo todavía. Motivo: {reason}")
+
         storage_root = st.text_input(
-            "Carpeta raíz de almacenamiento",
+            "Carpeta local temporal / fallback",
             value=st.session_state.app_config.get("storage_root", str(default_storage_root())),
-            help="Puedes apuntar esto a una carpeta sincronizada con Google Drive para Desktop o OneDrive.",
+            help="En Streamlit Cloud esta carpeta es temporal. La persistencia real debe vivir en Google Drive.",
         )
-        st.caption(
-            "Ejemplo: una carpeta dentro de Google Drive en tu computador. La app guardará auditorías, evidencias, reportes y seguimiento dentro de esa ruta."
-        )
-        if st.button("Guardar configuración de carpeta"):
+        if st.button("Guardar configuración local"):
             st.session_state.app_config["storage_root"] = storage_root.strip() or str(default_storage_root())
             save_config(st.session_state.app_config)
             get_storage_paths()
-            st.success("Configuración guardada.")
+            st.success("Configuración local guardada.")
+
         current = get_storage_paths()
         st.code(str(current["root"]))
         st.markdown(
-            "**Estructura creada automáticamente**\n\n"
+            "**Estructura lógica**\n\n"
             "- `01_auditorias/` resumen, detalle y puntajes por espacio  \n"
             "- `02_evidencias/` fotos y videos  \n"
             "- `03_reportes/` informes HTML  \n"
             "- `04_seguimiento/` casos y timeline  \n"
             "- `05_exports/` CSV por auditoría"
         )
+
+        st.caption("Las credenciales de Google Drive no se ingresan aquí. Deben ir en los Secrets del despliegue de Streamlit.")
 
 
 def render_meta() -> None:
@@ -1474,6 +1802,10 @@ def render_summary() -> None:
                 st.info(
                     f"Reporte: {result.get('report_path', '-')} · JSON: {result.get('json_path', '-')} · Casos creados: {result.get('cases_created', 0)} · actualizados: {result.get('cases_updated', 0)}"
                 )
+                if result.get("report_drive_link"):
+                    st.link_button("Abrir reporte en Google Drive", result["report_drive_link"])
+                if result.get("json_drive_link"):
+                    st.link_button("Abrir JSON en Google Drive", result["json_drive_link"])
     with c2:
         if st.button("Reiniciar respuestas", use_container_width=True):
             reset_responses()
@@ -1485,6 +1817,7 @@ def render_summary() -> None:
 
 def render_history_tab() -> None:
     st.markdown("### Historial, reportes y evidencias")
+    sync_master_tables_from_drive(force=True)
     paths = get_storage_paths()
     audits_path = paths["audits"] / "audits_summary.csv"
     items_path = paths["audits"] / "audit_items.csv"
@@ -1519,6 +1852,21 @@ def render_history_tab() -> None:
         st.write(f"**JSON:** `{selected['json_path']}`")
     st.write(f"**Carpeta evidencias:** `{selected['evidence_dir']}`")
     st.markdown('</div>', unsafe_allow_html=True)
+
+    report_drive_link = str(selected.get("report_drive_link", "") or "")
+    json_drive_link = str(selected.get("json_drive_link", "") or "")
+    evidence_drive_folder_link = str(selected.get("evidence_drive_folder_link", "") or "")
+
+    l1, l2, l3 = st.columns(3)
+    with l1:
+        if report_drive_link:
+            st.link_button("Abrir reporte en Drive", report_drive_link)
+    with l2:
+        if json_drive_link:
+            st.link_button("Abrir JSON en Drive", json_drive_link)
+    with l3:
+        if evidence_drive_folder_link:
+            st.link_button("Abrir carpeta de evidencias", evidence_drive_folder_link)
 
     d1, d2 = st.columns(2)
     report_path = Path(selected["report_path"])
@@ -1566,19 +1914,25 @@ def render_history_tab() -> None:
     for _, row in evidence_filtered.iterrows():
         st.markdown(f"**{row['space']} · {row['question']}**")
         p = Path(row["path"])
+        drive_link = str(row.get("drive_web_view_link", "") or "")
+        mime = str(row.get("mime", ""))
         if p.exists():
-            mime = str(row.get("mime", ""))
             if mime.startswith("image/"):
                 st.image(str(p), caption=p.name, use_container_width=True)
             elif mime.startswith("video/"):
                 st.video(str(p))
             else:
                 st.write(p.name)
-        st.caption(str(p))
+            st.caption(str(p))
+        elif drive_link:
+            st.caption("Archivo disponible en Drive")
+        if drive_link:
+            st.link_button(f"Abrir {row.get('file_name', 'archivo')} en Drive", drive_link)
 
 
 def render_cases_tab() -> None:
     st.markdown("### Seguimiento de casos")
+    sync_case_tables_from_drive(force=True)
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -1666,24 +2020,25 @@ def architecture_view() -> None:
     with st.expander("Cómo aterrizar Google Drive y el flujo completo"):
         st.markdown(
             """
-**Forma simple de llevarlo a la nube**
+**Forma recomendada para esta app publicada y usada desde el teléfono**
 
-1. Instala Google Drive para Desktop en el computador que ejecuta la app.  
-2. Crea una carpeta como `Google Drive/MQ Auditorías`.  
-3. En la app, pega esa ruta en **Carpeta raíz de almacenamiento**.  
-4. Desde ese momento, las auditorías, evidencias y reportes se guardarán en la carpeta sincronizada.  
+1. La app se despliega en Streamlit Community Cloud.  
+2. Las credenciales de Google Drive se guardan en **Secrets** del despliegue.  
+3. Al guardar una auditoría, el servidor sube evidencias, JSON, HTML y CSV a tu Drive.  
+4. Luego, desde **Historial y evidencias**, puedes abrir directamente los archivos en Drive.  
 
 **Qué produce esta versión**
 - Registro por auditoría.
 - Detalle por pregunta.
 - Evidencias por hallazgo.
 - Informe HTML descargable.
+- JSON descargable.
 - Casos automáticos de seguimiento.
 - Timeline manual para cierre de casos.
 
-**Siguiente evolución recomendada**
+**Recomendación futura**
 - Base de datos para multiusuario.
-- Integración directa con Google Drive API.
+- PDF automático.
 - Dashboard histórico y semáforo de vencimientos.
             """
         )
@@ -1703,7 +2058,11 @@ def render_audit_tab() -> None:
 def main() -> None:
     inject_css()
     init_state()
+    if drive_enabled():
+        sync_master_tables_from_drive(force=False)
     header()
+    if st.session_state.get("drive_init_error"):
+        st.warning(f"Google Drive no pudo inicializarse: {st.session_state['drive_init_error']}")
     tab1, tab2, tab3 = st.tabs(["Auditoría", "Historial y evidencias", "Casos y seguimiento"])
     with tab1:
         render_audit_tab()
