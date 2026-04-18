@@ -363,62 +363,187 @@ def get_storage_paths() -> dict[str, Path]:
 
 def get_google_drive_config() -> dict[str, Any]:
     try:
-        raw_cfg = st.secrets["google_drive"]
+        raw_cfg = st.secrets["google_oauth"]
         cfg = dict(raw_cfg)
     except Exception:
-        return {"enabled": False, "reason": "No hay sección [google_drive] en secrets."}
+        return {"enabled": False, "reason": "No hay sección [google_oauth] en secrets."}
 
     enabled = bool(cfg.get("enabled", True))
     folder_id = str(cfg.get("folder_id", "")).strip()
-    service_account_json = str(cfg.get("service_account_json", "")).strip()
+    client_id = str(cfg.get("client_id", "")).strip()
+    client_secret = str(cfg.get("client_secret", "")).strip()
+    redirect_uri = str(cfg.get("redirect_uri", "")).strip()
+    raw_scopes = cfg.get("scopes", ["https://www.googleapis.com/auth/drive.file"])
+    if isinstance(raw_scopes, str):
+        scopes = [raw_scopes]
+    else:
+        scopes = [str(scope) for scope in raw_scopes]
 
     if not enabled:
-        return {"enabled": False, "reason": "Google Drive está desactivado en secrets."}
+        return {"enabled": False, "reason": "Google OAuth está desactivado en secrets."}
     if not folder_id:
-        return {"enabled": False, "reason": "Falta google_drive.folder_id en secrets."}
-    if not service_account_json:
-        return {"enabled": False, "reason": "Falta google_drive.service_account_json en secrets."}
+        return {"enabled": False, "reason": "Falta google_oauth.folder_id en secrets."}
+    if not client_id or not client_secret or not redirect_uri:
+        return {"enabled": False, "reason": "Faltan client_id, client_secret o redirect_uri en [google_oauth]."}
 
     return {
         "enabled": True,
         "folder_id": folder_id,
-        "service_account_json": service_account_json,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "scopes": scopes,
     }
-
-
-@st.cache_resource(show_spinner=False)
-def get_drive_service(service_account_json: str):
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
-    info = json.loads(service_account_json)
-    if "private_key" in info and isinstance(info["private_key"], str):
-        info["private_key"] = info["private_key"].replace("\\n", "\n")
-
-    credentials = service_account.Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/drive"],
-    )
-    return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
 def drive_enabled() -> bool:
     return bool(get_google_drive_config().get("enabled", False))
 
 
+def get_oauth_token_path() -> Path:
+    return APP_DATA_DIR / "google_oauth_token.json"
+
+
+def credentials_to_info(credentials) -> dict[str, Any]:
+    return {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "token_uri": credentials.token_uri,
+        "client_id": credentials.client_id,
+        "client_secret": credentials.client_secret,
+        "scopes": credentials.scopes,
+    }
+
+
+def load_saved_drive_credentials_info() -> dict[str, Any] | None:
+    info = st.session_state.get("google_oauth_credentials_info")
+    if info:
+        return info
+    token_path = get_oauth_token_path()
+    if token_path.exists():
+        try:
+            info = json.loads(token_path.read_text(encoding="utf-8"))
+            st.session_state.google_oauth_credentials_info = info
+            return info
+        except Exception:
+            return None
+    return None
+
+
+def save_drive_credentials(credentials) -> None:
+    info = credentials_to_info(credentials)
+    st.session_state.google_oauth_credentials_info = info
+    get_oauth_token_path().write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clear_drive_credentials() -> None:
+    st.session_state.pop("google_oauth_credentials_info", None)
+    st.session_state.pop("drive_folder_map", None)
+    st.session_state.pop("drive_master_synced", None)
+    token_path = get_oauth_token_path()
+    if token_path.exists():
+        token_path.unlink()
+
+
+def get_oauth_flow(state: str | None = None):
+    from google_auth_oauthlib.flow import Flow
+
+    cfg = get_google_drive_config()
+    client_config = {
+        "web": {
+            "client_id": cfg["client_id"],
+            "client_secret": cfg["client_secret"],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+    flow = Flow.from_client_config(client_config, scopes=cfg["scopes"], state=state)
+    flow.redirect_uri = cfg["redirect_uri"]
+    return flow
+
+
+def get_google_auth_url() -> str:
+    flow = get_oauth_flow()
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    st.session_state.google_oauth_state = state
+    return auth_url
+
+
+def handle_google_oauth_callback() -> None:
+    if not drive_enabled():
+        return
+    try:
+        qp = st.query_params
+        error = qp.get("error")
+        code = qp.get("code")
+        state = qp.get("state")
+    except Exception:
+        return
+
+    if error:
+        st.session_state.drive_status_message = f"Google OAuth devolvió error: {error}"
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+        return
+
+    if not code:
+        return
+
+    try:
+        expected_state = st.session_state.get("google_oauth_state")
+        flow = get_oauth_flow(state=state or expected_state)
+        flow.fetch_token(code=code)
+        save_drive_credentials(flow.credentials)
+        st.session_state.drive_status_message = "Google Drive conectado correctamente."
+        st.session_state.pop("drive_init_error", None)
+    except Exception as exc:
+        st.session_state.drive_init_error = str(exc)
+        st.session_state.drive_status_message = f"No se pudo completar OAuth: {exc}"
+    finally:
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+
+
 def get_drive_client():
     cfg = get_google_drive_config()
     if not cfg.get("enabled"):
         return None
+
     try:
-        return get_drive_service(cfg["service_account_json"])
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+
+        info = load_saved_drive_credentials_info()
+        if not info:
+            return None
+
+        credentials = Credentials.from_authorized_user_info(info, scopes=cfg["scopes"])
+        if credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request())
+            save_drive_credentials(credentials)
+        if not credentials.valid:
+            return None
+        return build("drive", "v3", credentials=credentials, cache_discovery=False)
     except Exception as exc:
         st.session_state["drive_init_error"] = str(exc)
         return None
 
 
 def _drive_query_escape(value: str) -> str:
-    return value.replace("'", "\\'")
+    return value.replace("'", "\'")
+
+
+def _record_drive_error(exc: Exception, prefix: str = "No se pudo usar Google Drive") -> None:
+    st.session_state.drive_status_message = f"{prefix}: {exc}. Los datos siguen guardados localmente. ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
 
 
 def ensure_drive_folder(service, parent_id: str, folder_name: str) -> dict[str, str]:
@@ -427,37 +552,41 @@ def ensure_drive_folder(service, parent_id: str, folder_name: str) -> dict[str, 
         f"name = '{escaped_name}' and mimeType = 'application/vnd.google-apps.folder' "
         f"and '{parent_id}' in parents and trashed = false"
     )
-    response = service.files().list(
-        q=query,
-        fields="files(id, name, webViewLink)",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-        pageSize=10,
-    ).execute()
-    files = response.get("files", [])
-    if files:
-        folder = files[0]
-        return {
-            "id": folder["id"],
-            "name": folder.get("name", folder_name),
-            "webViewLink": folder.get("webViewLink", f"https://drive.google.com/drive/folders/{folder['id']}"),
-        }
+    try:
+        response = service.files().list(
+            q=query,
+            fields="files(id, name, webViewLink)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            pageSize=10,
+        ).execute()
+        files = response.get("files", [])
+        if files:
+            folder = files[0]
+            return {
+                "id": folder["id"],
+                "name": folder.get("name", folder_name),
+                "webViewLink": folder.get("webViewLink", f"https://drive.google.com/drive/folders/{folder['id']}"),
+            }
 
-    metadata = {
-        "name": folder_name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
-    }
-    created = service.files().create(
-        body=metadata,
-        fields="id, name, webViewLink",
-        supportsAllDrives=True,
-    ).execute()
-    return {
-        "id": created["id"],
-        "name": created.get("name", folder_name),
-        "webViewLink": created.get("webViewLink", f"https://drive.google.com/drive/folders/{created['id']}"),
-    }
+        metadata = {
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        }
+        created = service.files().create(
+            body=metadata,
+            fields="id, name, webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+        return {
+            "id": created["id"],
+            "name": created.get("name", folder_name),
+            "webViewLink": created.get("webViewLink", f"https://drive.google.com/drive/folders/{created['id']}"),
+        }
+    except Exception as exc:
+        _record_drive_error(exc)
+        return {}
 
 
 def get_drive_folder_map() -> dict[str, dict[str, str]]:
@@ -484,25 +613,35 @@ def get_drive_folder_map() -> dict[str, dict[str, str]]:
         ("tracking", "04_seguimiento"),
         ("exports", "05_exports"),
     ]
-    for key, folder_name in folder_specs:
-        folder_map[key] = ensure_drive_folder(service, root_id, folder_name)
-
-    st.session_state.drive_folder_map = folder_map
-    return folder_map
+    try:
+        for key, folder_name in folder_specs:
+            folder = ensure_drive_folder(service, root_id, folder_name)
+            if not folder:
+                return {}
+            folder_map[key] = folder
+        st.session_state.drive_folder_map = folder_map
+        return folder_map
+    except Exception as exc:
+        _record_drive_error(exc)
+        return {}
 
 
 def find_drive_file(service, parent_id: str, file_name: str) -> dict[str, Any] | None:
     escaped_name = _drive_query_escape(file_name)
     query = f"name = '{escaped_name}' and '{parent_id}' in parents and trashed = false"
-    response = service.files().list(
-        q=query,
-        fields="files(id, name, mimeType, webViewLink, webContentLink)",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-        pageSize=10,
-    ).execute()
-    files = response.get("files", [])
-    return files[0] if files else None
+    try:
+        response = service.files().list(
+            q=query,
+            fields="files(id, name, mimeType, webViewLink, webContentLink)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            pageSize=10,
+        ).execute()
+        files = response.get("files", [])
+        return files[0] if files else None
+    except Exception as exc:
+        _record_drive_error(exc)
+        return None
 
 
 def upload_file_to_drive(local_path: Path, parent_id: str, mime_type: str | None = None, overwrite: bool = True) -> dict[str, Any]:
@@ -512,25 +651,30 @@ def upload_file_to_drive(local_path: Path, parent_id: str, mime_type: str | None
 
     from googleapiclient.http import MediaFileUpload
 
-    existing = find_drive_file(service, parent_id, local_path.name) if overwrite else None
-    media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=False)
+    try:
+        existing = find_drive_file(service, parent_id, local_path.name) if overwrite else None
+        media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=False)
 
-    if existing:
-        uploaded = service.files().update(
-            fileId=existing["id"],
-            media_body=media,
-            fields="id, name, webViewLink, webContentLink",
-            supportsAllDrives=True,
-        ).execute()
-    else:
-        metadata = {"name": local_path.name, "parents": [parent_id]}
-        uploaded = service.files().create(
-            body=metadata,
-            media_body=media,
-            fields="id, name, webViewLink, webContentLink",
-            supportsAllDrives=True,
-        ).execute()
-    return uploaded
+        if existing:
+            uploaded = service.files().update(
+                fileId=existing["id"],
+                media_body=media,
+                fields="id, name, webViewLink, webContentLink",
+                supportsAllDrives=True,
+            ).execute()
+        else:
+            metadata = {"name": local_path.name, "parents": [parent_id]}
+            uploaded = service.files().create(
+                body=metadata,
+                media_body=media,
+                fields="id, name, webViewLink, webContentLink",
+                supportsAllDrives=True,
+            ).execute()
+        st.session_state.drive_status_message = f"Archivo sincronizado con Google Drive: {local_path.name}"
+        return uploaded
+    except Exception as exc:
+        _record_drive_error(exc, prefix="No se pudo subir a Google Drive")
+        return {}
 
 
 def download_drive_file_to_path(file_id: str, destination: Path) -> None:
@@ -539,97 +683,60 @@ def download_drive_file_to_path(file_id: str, destination: Path) -> None:
         return
     from googleapiclient.http import MediaIoBaseDownload
 
-    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(fh.getvalue())
+    try:
+        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(fh.getvalue())
+    except Exception as exc:
+        _record_drive_error(exc, prefix="No se pudo descargar desde Google Drive")
 
 
-
-
-def set_drive_status(level: str, message: str) -> None:
-    st.session_state["drive_status"] = {"level": level, "message": message, "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-
-
-def get_drive_status() -> dict[str, str]:
-    return st.session_state.get("drive_status", {})
-
-
-def render_drive_status() -> None:
-    status = get_drive_status()
-    if not status:
-        return
-    msg = f"{status.get('message', '')} ({status.get('at', '')})"
-    level = status.get('level', 'info')
-    if level == 'success':
-        st.success(msg)
-    elif level == 'warning':
-        st.warning(msg)
-    elif level == 'error':
-        st.error(msg)
-    else:
-        st.info(msg)
 def sync_master_tables_from_drive(force: bool = False) -> None:
     if not drive_enabled():
-        set_drive_status("info", "Google Drive no está habilitado. Se usan datos locales.")
         return
     if st.session_state.get("drive_master_synced") and not force:
         return
 
     paths = get_storage_paths()
-    try:
-        folder_map = get_drive_folder_map()
-        service = get_drive_client()
-        if not folder_map or service is None:
-            set_drive_status("warning", "No se pudo inicializar Google Drive. Se usan datos locales.")
-            return
+    folder_map = get_drive_folder_map()
+    service = get_drive_client()
+    if not folder_map or service is None:
+        return
 
-        downloaded = 0
+    try:
         for section, file_name in MASTER_TABLES:
             parent_id = folder_map[section]["id"]
-            try:
-                drive_file = find_drive_file(service, parent_id, file_name)
-            except Exception as exc:
-                set_drive_status("warning", f"No se pudo consultar Google Drive: {exc}. Se usan datos locales.")
-                return
+            drive_file = find_drive_file(service, parent_id, file_name)
             if drive_file:
                 local_path = paths[section] / file_name
-                try:
-                    download_drive_file_to_path(drive_file["id"], local_path)
-                    downloaded += 1
-                except Exception:
-                    pass
-
+                download_drive_file_to_path(drive_file["id"], local_path)
         st.session_state.drive_master_synced = True
-        set_drive_status("success", f"Sincronización desde Google Drive completada. Archivos descargados: {downloaded}.")
+        st.session_state.drive_status_message = "Sincronización desde Google Drive completada."
     except Exception as exc:
-        set_drive_status("warning", f"No se pudo sincronizar desde Google Drive: {exc}. Se usan datos locales.")
+        _record_drive_error(exc, prefix="No se pudo sincronizar desde Google Drive")
 
 
 def sync_master_tables_to_drive() -> None:
     if not drive_enabled():
         return
 
-    try:
-        paths = get_storage_paths()
-        folder_map = get_drive_folder_map()
-        if not folder_map:
-            return
+    paths = get_storage_paths()
+    folder_map = get_drive_folder_map()
+    if not folder_map:
+        return
 
-        uploaded = 0
+    try:
         for section, file_name in MASTER_TABLES:
             local_path = paths[section] / file_name
             if local_path.exists():
-                result = upload_file_to_drive(local_path, folder_map[section]["id"], mime_type="text/csv", overwrite=True)
-                if result:
-                    uploaded += 1
-        set_drive_status("success", f"Sincronización hacia Google Drive completada. Archivos subidos: {uploaded}.")
+                upload_file_to_drive(local_path, folder_map[section]["id"], mime_type="text/csv", overwrite=True)
     except Exception as exc:
-        set_drive_status("warning", f"No se pudo subir a Google Drive: {exc}. Los datos siguen guardados localmente.")
+        _record_drive_error(exc, prefix="No se pudo sincronizar hacia Google Drive")
 
 
 def sync_case_tables_from_drive(force: bool = False) -> None:
@@ -640,50 +747,45 @@ def upload_saved_media_to_drive(audit_id: str, key: str, saved_files: list[dict[
     if not drive_enabled() or not saved_files:
         return saved_files, "", ""
 
-    try:
-        folder_map = get_drive_folder_map()
-        service = get_drive_client()
-        if not folder_map or service is None:
-            return saved_files, "", ""
+    folder_map = get_drive_folder_map()
+    service = get_drive_client()
+    if not folder_map or service is None:
+        return saved_files, "", ""
 
+    try:
         audit_folder = ensure_drive_folder(service, folder_map["media"]["id"], audit_id)
+        if not audit_folder:
+            return saved_files, "", ""
         item_folder = ensure_drive_folder(service, audit_folder["id"], slugify(key))
+        if not item_folder:
+            return saved_files, audit_folder.get("id", ""), audit_folder.get("webViewLink", "")
 
         enriched = []
-        failed = 0
         for media in saved_files:
-            try:
-                uploaded = upload_file_to_drive(Path(media["path"]), item_folder["id"], mime_type=media.get("mime"), overwrite=True)
-            except Exception:
-                uploaded = {}
-                failed += 1
+            uploaded = upload_file_to_drive(Path(media["path"]), item_folder["id"], mime_type=media.get("mime"), overwrite=True)
             enriched.append({
                 **media,
                 "drive_file_id": uploaded.get("id", ""),
                 "drive_web_view_link": uploaded.get("webViewLink", ""),
                 "drive_web_content_link": uploaded.get("webContentLink", ""),
             })
-        if failed:
-            set_drive_status("warning", f"Algunas evidencias no se pudieron subir a Google Drive ({failed}). La auditoría seguirá guardándose localmente.")
-        return enriched, audit_folder.get("id", ""), audit_folder.get("webViewLink", "")
+        return enriched, item_folder.get("id", ""), item_folder.get("webViewLink", "")
     except Exception as exc:
-        set_drive_status("warning", f"No se pudieron subir evidencias a Google Drive: {exc}. La auditoría seguirá guardándose localmente.")
+        _record_drive_error(exc, prefix="No se pudieron subir evidencias a Google Drive")
         return saved_files, "", ""
 
 
 def sync_artifact_to_drive(local_path: Path, section: str, mime_type: str) -> dict[str, Any]:
     if not drive_enabled() or not local_path.exists():
         return {}
+    folder_map = get_drive_folder_map()
+    if not folder_map:
+        return {}
     try:
-        folder_map = get_drive_folder_map()
-        if not folder_map:
-            return {}
         return upload_file_to_drive(local_path, folder_map[section]["id"], mime_type=mime_type, overwrite=True)
     except Exception as exc:
-        set_drive_status("warning", f"No se pudo subir {local_path.name} a Google Drive: {exc}. Se mantiene localmente.")
+        _record_drive_error(exc, prefix="No se pudo subir artefacto a Google Drive")
         return {}
-
-
 # -----------------------------
 # Helpers generales
 # -----------------------------
@@ -803,8 +905,6 @@ def init_state() -> None:
         st.session_state.saved_message = ""
     if "last_save_result" not in st.session_state:
         st.session_state.last_save_result = {}
-    if "drive_status" not in st.session_state:
-        st.session_state.drive_status = {}
 
 
 # -----------------------------
@@ -1210,7 +1310,10 @@ def generate_report_json(
 # -----------------------------
 
 def upsert_followup_cases(audit_id: str, items_df: pd.DataFrame) -> tuple[int, int]:
-    # sincronización manual opcional con Drive
+    try:
+        sync_case_tables_from_drive(force=False)
+    except Exception:
+        pass
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -1317,7 +1420,10 @@ def upsert_followup_cases(audit_id: str, items_df: pd.DataFrame) -> tuple[int, i
 
 
 def update_case_record(case_id: str, updates: dict[str, Any], note: str) -> None:
-    # sincronización manual opcional con Drive
+    try:
+        sync_case_tables_from_drive(force=False)
+    except Exception:
+        pass
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -1356,7 +1462,10 @@ def update_case_record(case_id: str, updates: dict[str, Any], note: str) -> None
 # -----------------------------
 
 def save_audit() -> None:
-    # sincronización manual opcional con Drive
+    try:
+        sync_master_tables_from_drive(force=False)
+    except Exception:
+        pass
     audit_id = now_id("AUD")
     timestamp_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     score, progress, issues, answered, total_questions = calculate_score()
@@ -1662,13 +1771,25 @@ def render_storage_config() -> None:
         st.markdown("#### Backend actual")
         if drive_ok:
             folder_map = get_drive_folder_map()
-            st.success("Google Drive conectado correctamente. Esta app puede guardar desde el teléfono y dejar todo en tu Drive.")
+            st.success("Google Drive conectado con OAuth 2.0. Esta app puede guardar en tu Google Drive personal.")
             st.write(f"**Carpeta raíz Drive:** `{cfg.get('folder_id', '')}`")
             if folder_map.get("root", {}).get("webViewLink"):
                 st.link_button("Abrir carpeta raíz en Drive", folder_map["root"]["webViewLink"])
+            c1, c2 = st.columns(2)
+            with c1:
+                st.link_button("Volver a autorizar con Google", get_google_auth_url())
+            with c2:
+                if st.button("Desconectar Google Drive", key="oauth_disconnect"):
+                    clear_drive_credentials()
+                    st.success("Conexión eliminada de esta app.")
         else:
             reason = cfg.get("reason", st.session_state.get("drive_init_error", "No se pudo inicializar Google Drive."))
             st.warning(f"Google Drive no está activo todavía. Motivo: {reason}")
+            if drive_enabled():
+                st.link_button("Conectar con Google Drive", get_google_auth_url())
+
+        if st.session_state.get("drive_status_message"):
+            st.info(st.session_state["drive_status_message"])
 
         storage_root = st.text_input(
             "Carpeta local temporal / fallback",
@@ -1692,7 +1813,7 @@ def render_storage_config() -> None:
             "- `05_exports/` CSV por auditoría"
         )
 
-        st.caption("Las credenciales de Google Drive no se ingresan aquí. Deben ir en los Secrets del despliegue de Streamlit.")
+        st.caption("Configura OAuth en los Secrets del despliegue. La conexión del usuario se hace con el botón de Google dentro de esta app.")
 
 
 def render_meta() -> None:
@@ -1856,13 +1977,8 @@ def render_summary() -> None:
             elif not st.session_state.audit_meta["auditor"].strip():
                 st.error("Ingresa el nombre del auditor antes de guardar.")
             else:
-                try:
-                    save_audit()
-                    st.success(st.session_state.saved_message)
-                except Exception as exc:
-                    set_drive_status("error", f"Error al guardar auditoría: {exc}")
-                    st.error(f"No se pudo guardar la auditoría completa: {exc}")
-                    return
+                save_audit()
+                st.success(st.session_state.saved_message)
                 result = st.session_state.last_save_result
                 st.info(
                     f"Reporte: {result.get('report_path', '-')} · JSON: {result.get('json_path', '-')} · Casos creados: {result.get('cases_created', 0)} · actualizados: {result.get('cases_updated', 0)}"
@@ -1882,12 +1998,17 @@ def render_summary() -> None:
 
 def render_history_tab() -> None:
     st.markdown("### Historial, reportes y evidencias")
-    render_drive_status()
-    c_sync1, c_sync2 = st.columns([1,3])
+    c_sync1, c_sync2 = st.columns([1,2])
     with c_sync1:
-        if st.button("Sincronizar historial con Google Drive"):
-            sync_master_tables_from_drive(force=True)
-            st.rerun()
+        if st.button("Sincronizar historial con Google Drive", key="sync_history_drive"):
+            try:
+                sync_master_tables_from_drive(force=True)
+                st.success("Historial sincronizado desde Google Drive.")
+            except Exception as exc:
+                st.warning(f"No se pudo sincronizar historial: {exc}")
+    with c_sync2:
+        if st.session_state.get("drive_status_message"):
+            st.caption(st.session_state["drive_status_message"])
     paths = get_storage_paths()
     audits_path = paths["audits"] / "audits_summary.csv"
     items_path = paths["audits"] / "audit_items.csv"
@@ -2002,12 +2123,10 @@ def render_history_tab() -> None:
 
 def render_cases_tab() -> None:
     st.markdown("### Seguimiento de casos")
-    render_drive_status()
-    c_sync1, c_sync2 = st.columns([1,3])
-    with c_sync1:
-        if st.button("Sincronizar casos con Google Drive"):
-            sync_case_tables_from_drive(force=True)
-            st.rerun()
+    try:
+        sync_case_tables_from_drive(force=False)
+    except Exception:
+        pass
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -2080,13 +2199,9 @@ def render_cases_tab() -> None:
             "due_date": due_date_value.isoformat() if due_date_value else "",
         }
         note = followup_note.strip() or f"Caso actualizado a estado {case_status}."
-        try:
-            update_case_record(selected_case_id, updates, note)
-            st.success("Seguimiento guardado.")
-            st.rerun()
-        except Exception as exc:
-            set_drive_status("error", f"No se pudo guardar el seguimiento: {exc}")
-            st.error(f"No se pudo guardar el seguimiento: {exc}")
+        update_case_record(selected_case_id, updates, note)
+        st.success("Seguimiento guardado.")
+        st.rerun()
 
     if not events_df.empty:
         case_events = events_df[events_df["case_id"] == selected_case_id].sort_values("event_at", ascending=False)
