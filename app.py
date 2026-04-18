@@ -406,6 +406,11 @@ def drive_enabled() -> bool:
     return bool(get_google_drive_config().get("enabled", False))
 
 
+def set_drive_status(message: str, level: str = "info") -> None:
+    st.session_state["drive_status_message"] = message
+    st.session_state["drive_status_level"] = level
+
+
 def get_drive_client():
     cfg = get_google_drive_config()
     if not cfg.get("enabled"):
@@ -590,7 +595,10 @@ def sync_master_tables_to_drive() -> None:
 
 
 def sync_case_tables_from_drive(force: bool = False) -> None:
-    sync_master_tables_from_drive(force=force)
+    try:
+        sync_master_tables_from_drive(force=force)
+    except Exception as exc:
+        set_drive_status(f"No se pudo sincronizar casos desde Google Drive: {exc}", "warning")
 
 
 def upload_saved_media_to_drive(audit_id: str, key: str, saved_files: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str, str]:
@@ -620,10 +628,14 @@ def upload_saved_media_to_drive(audit_id: str, key: str, saved_files: list[dict[
 def sync_artifact_to_drive(local_path: Path, section: str, mime_type: str) -> dict[str, Any]:
     if not drive_enabled() or not local_path.exists():
         return {}
-    folder_map = get_drive_folder_map()
-    if not folder_map:
+    try:
+        folder_map = get_drive_folder_map()
+        if not folder_map:
+            return {}
+        return upload_file_to_drive(local_path, folder_map[section]["id"], mime_type=mime_type, overwrite=True)
+    except Exception as exc:
+        set_drive_status(f"No se pudo subir {local_path.name} a Google Drive: {exc}", "warning")
         return {}
-    return upload_file_to_drive(local_path, folder_map[section]["id"], mime_type=mime_type, overwrite=True)
 
 
 # -----------------------------
@@ -1150,7 +1162,7 @@ def generate_report_json(
 # -----------------------------
 
 def upsert_followup_cases(audit_id: str, items_df: pd.DataFrame) -> tuple[int, int]:
-    sync_case_tables_from_drive(force=True)
+    sync_case_tables_from_drive(force=False)
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -1257,7 +1269,7 @@ def upsert_followup_cases(audit_id: str, items_df: pd.DataFrame) -> tuple[int, i
 
 
 def update_case_record(case_id: str, updates: dict[str, Any], note: str) -> None:
-    sync_case_tables_from_drive(force=True)
+    sync_case_tables_from_drive(force=False)
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -1296,7 +1308,7 @@ def update_case_record(case_id: str, updates: dict[str, Any], note: str) -> None
 # -----------------------------
 
 def save_audit() -> None:
-    sync_master_tables_from_drive(force=True)
+    sync_master_tables_from_drive(force=False)
     audit_id = now_id("AUD")
     timestamp_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     score, progress, issues, answered, total_questions = calculate_score()
@@ -1421,10 +1433,13 @@ def save_audit() -> None:
 
     media_drive_folder_link = ""
     if drive_enabled():
-        folder_map = get_drive_folder_map()
-        service = get_drive_client()
-        if folder_map and service is not None:
-            media_drive_folder_link = ensure_drive_folder(service, folder_map["media"]["id"], audit_id).get("webViewLink", "")
+        try:
+            folder_map = get_drive_folder_map()
+            service = get_drive_client()
+            if folder_map and service is not None:
+                media_drive_folder_link = ensure_drive_folder(service, folder_map["media"]["id"], audit_id).get("webViewLink", "")
+        except Exception as exc:
+            set_drive_status(f"No se pudo obtener la carpeta de evidencias en Drive: {exc}", "warning")
 
     audits_summary_df = pd.DataFrame(
         [
@@ -1633,6 +1648,10 @@ def render_storage_config() -> None:
         )
 
         st.caption("Las credenciales de Google Drive no se ingresan aquí. Deben ir en los Secrets del despliegue de Streamlit.")
+        status_msg = st.session_state.get("drive_status_message", "")
+        if status_msg:
+            level = st.session_state.get("drive_status_level", "info")
+            getattr(st, level if level in {"success", "warning", "error", "info"} else "info")(status_msg)
 
 
 def render_meta() -> None:
@@ -1817,7 +1836,16 @@ def render_summary() -> None:
 
 def render_history_tab() -> None:
     st.markdown("### Historial, reportes y evidencias")
-    sync_master_tables_from_drive(force=True)
+    c_sync1, c_sync2 = st.columns([1,2])
+    with c_sync1:
+        if st.button("Sincronizar historial con Drive"):
+            sync_master_tables_from_drive(force=True)
+    with c_sync2:
+        status_msg = st.session_state.get("drive_status_message", "")
+        if status_msg:
+            level = st.session_state.get("drive_status_level", "info")
+            getattr(st, level if level in {"success", "warning", "error", "info"} else "info")(status_msg)
+    sync_master_tables_from_drive(force=False)
     paths = get_storage_paths()
     audits_path = paths["audits"] / "audits_summary.csv"
     items_path = paths["audits"] / "audit_items.csv"
@@ -1932,7 +1960,16 @@ def render_history_tab() -> None:
 
 def render_cases_tab() -> None:
     st.markdown("### Seguimiento de casos")
-    sync_case_tables_from_drive(force=True)
+    c_sync1, c_sync2 = st.columns([1,2])
+    with c_sync1:
+        if st.button("Sincronizar casos con Drive"):
+            sync_case_tables_from_drive(force=True)
+    with c_sync2:
+        status_msg = st.session_state.get("drive_status_message", "")
+        if status_msg:
+            level = st.session_state.get("drive_status_level", "info")
+            getattr(st, level if level in {"success", "warning", "error", "info"} else "info")(status_msg)
+    sync_case_tables_from_drive(force=False)
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
