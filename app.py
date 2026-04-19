@@ -20,6 +20,8 @@ APP_DIR = Path(__file__).parent
 APP_DATA_DIR = APP_DIR / "app_data"
 APP_DATA_DIR.mkdir(exist_ok=True)
 CONFIG_PATH = APP_DATA_DIR / "config.json"
+DRAFT_PATH = APP_DATA_DIR / "draft_audit.json"
+DRAFT_MEDIA_DIR = APP_DATA_DIR / "draft_media"
 
 STATUS_OPTIONS = ["Pendiente", "Perfecto estado", "Necesita mantenimiento", "Mal estado", "No aplica"]
 STATUS_FACTOR = {
@@ -871,6 +873,8 @@ def parse_optional_date(raw_value: Any) -> str:
         return raw_value.isoformat()
     return str(raw_value)
 
+# DRAFT PLACEHOLDER
+
 
 # -----------------------------
 # Estado de la app
@@ -895,7 +899,7 @@ def init_state() -> None:
             key = f"{space['space']}|{item['question']}"
             if key not in st.session_state.responses:
                 st.session_state.responses[key] = {
-                    "status": "Pendiente",
+                    "status": "Perfecto estado",
                     "observation": "",
                     "action": "Sin acción",
                     "media_saved": [],
@@ -1814,7 +1818,6 @@ def render_storage_config() -> None:
         )
 
         st.caption("Configura OAuth en los Secrets del despliegue. La conexión del usuario se hace con el botón de Google dentro de esta app.")
-        st.info("Durante la auditoría ya no se sincroniza automáticamente con Google Drive. La subida ocurre al guardar la auditoría o cuando usas los botones manuales de sincronización.")
 
 
 def render_meta() -> None:
@@ -1928,7 +1931,7 @@ def reset_responses() -> None:
         for item in space["items"]:
             key = f"{space['space']}|{item['question']}"
             st.session_state.responses[key] = {
-                "status": "Pendiente",
+                "status": "Perfecto estado",
                 "observation": "",
                 "action": "Sin acción",
                 "media_saved": [],
@@ -2124,17 +2127,10 @@ def render_history_tab() -> None:
 
 def render_cases_tab() -> None:
     st.markdown("### Seguimiento de casos")
-    c_sync1, c_sync2 = st.columns([1,2])
-    with c_sync1:
-        if st.button("Sincronizar casos con Google Drive", key="sync_cases_drive"):
-            try:
-                sync_case_tables_from_drive(force=True)
-                st.success("Casos sincronizados desde Google Drive.")
-            except Exception as exc:
-                st.warning(f"No se pudo sincronizar casos: {exc}")
-    with c_sync2:
-        if st.session_state.get("drive_status_message"):
-            st.caption(st.session_state["drive_status_message"])
+    try:
+        sync_case_tables_from_drive(force=False)
+    except Exception:
+        pass
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -2260,6 +2256,9 @@ def render_audit_tab() -> None:
 def main() -> None:
     inject_css()
     init_state()
+    handle_google_oauth_callback()
+    if drive_enabled():
+        sync_master_tables_from_drive(force=False)
     header()
     if st.session_state.get("drive_init_error"):
         st.warning(f"Google Drive no pudo inicializarse: {st.session_state['drive_init_error']}")
