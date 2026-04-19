@@ -895,7 +895,7 @@ def init_state() -> None:
             key = f"{space['space']}|{item['question']}"
             if key not in st.session_state.responses:
                 st.session_state.responses[key] = {
-                    "status": "Perfecto estado",
+                    "status": "Pendiente",
                     "observation": "",
                     "action": "Sin acción",
                     "media_saved": [],
@@ -1814,6 +1814,7 @@ def render_storage_config() -> None:
         )
 
         st.caption("Configura OAuth en los Secrets del despliegue. La conexión del usuario se hace con el botón de Google dentro de esta app.")
+        st.info("Durante la auditoría ya no se sincroniza automáticamente con Google Drive. La subida ocurre al guardar la auditoría o cuando usas los botones manuales de sincronización.")
 
 
 def render_meta() -> None:
@@ -1927,7 +1928,7 @@ def reset_responses() -> None:
         for item in space["items"]:
             key = f"{space['space']}|{item['question']}"
             st.session_state.responses[key] = {
-                "status": "Perfecto estado",
+                "status": "Pendiente",
                 "observation": "",
                 "action": "Sin acción",
                 "media_saved": [],
@@ -2123,10 +2124,17 @@ def render_history_tab() -> None:
 
 def render_cases_tab() -> None:
     st.markdown("### Seguimiento de casos")
-    try:
-        sync_case_tables_from_drive(force=False)
-    except Exception:
-        pass
+    c_sync1, c_sync2 = st.columns([1,2])
+    with c_sync1:
+        if st.button("Sincronizar casos con Google Drive", key="sync_cases_drive"):
+            try:
+                sync_case_tables_from_drive(force=True)
+                st.success("Casos sincronizados desde Google Drive.")
+            except Exception as exc:
+                st.warning(f"No se pudo sincronizar casos: {exc}")
+    with c_sync2:
+        if st.session_state.get("drive_status_message"):
+            st.caption(st.session_state["drive_status_message"])
     paths = get_storage_paths()
     cases_path = paths["tracking"] / "cases_followup.csv"
     events_path = paths["tracking"] / "case_events.csv"
@@ -2252,9 +2260,6 @@ def render_audit_tab() -> None:
 def main() -> None:
     inject_css()
     init_state()
-    handle_google_oauth_callback()
-    if drive_enabled():
-        sync_master_tables_from_drive(force=False)
     header()
     if st.session_state.get("drive_init_error"):
         st.warning(f"Google Drive no pudo inicializarse: {st.session_state['drive_init_error']}")
